@@ -1,0 +1,86 @@
+name: "Sync upstream"
+
+# Merges each new upstream release into this fork's main branch, tests it, and publishes it as <upstream tag>.1 for HACS.
+# Merge, not rebase: GITHUB_TOKEN cannot push commits that touch .github/workflows, and a rebase would rewrite the commit adding this file.
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency: sync-upstream
+
+env:
+  UPSTREAM: Athozs/hass-additional-ca
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Keep the schedule enabled"
+        # GitHub disables scheduled workflows after 60 days without repository activity
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/sync-upstream.yml/enable"
+
+      - name: "Find the latest upstream release"
+        id: upstream
+        run: |
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          pattern="^$(printf '%s' "$tag" | sed 's/\./\\./g')\.[0-9]+$"
+          if gh release list --repo "${{ github.repository }}" --limit 100 --json tagName --jq '.[].tagName' | grep -qE "$pattern"; then
+            echo "Upstream $tag is already released here."
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Checkout"
+        if: steps.upstream.outputs.new == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Merge the upstream release"
+        if: steps.upstream.outputs.new == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/${{ steps.upstream.outputs.tag }}"
+          git merge --no-edit -m "Merge upstream release ${{ steps.upstream.outputs.tag }}" FETCH_HEAD
+
+      - name: "Set up Python"
+        if: steps.upstream.outputs.new == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: "Unit tests"
+        if: steps.upstream.outputs.new == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_test.txt
+          python -m pytest test/unit/ -v --tb=short
+
+      - name: "Hassfest"
+        if: steps.upstream.outputs.new == 'true'
+        uses: home-assistant/actions/hassfest@master
+
+      - name: "Push"
+        if: steps.upstream.outputs.new == 'true'
+        run: git push origin HEAD:main
+
+      - name: "Publish the release"
+        if: steps.upstream.outputs.new == 'true'
+        run: |
+          tag="${{ steps.upstream.outputs.tag }}"
+          version="$tag.1"
+          yq -i -o json ".version=\"$version\"" custom_components/additional_ca/manifest.json
+          (cd custom_components/additional_ca && zip -r "$GITHUB_WORKSPACE/additional_ca.zip" ./)
+          git checkout custom_components/additional_ca/manifest.json
+          gh release create "$version" additional_ca.zip --target "$(git rev-parse HEAD)" --title "$version" \
+            --notes "Upstream [$tag](https://github.com/$UPSTREAM/releases/tag/$tag) plus loading custom CAs into Home Assistant's SSL contexts at startup, so a Home Assistant update needs no second restart."
