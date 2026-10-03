@@ -80,7 +80,7 @@ jobs:
           tag="${{ steps.upstream.outputs.tag }}"
           version="$tag.1"
           yq -i -o json ".version=\"$version\"" custom_components/additional_ca/manifest.json
-          (cd custom_components/additional_ca && zip -r "$GITHUB_WORKSPACE/additional_ca.zip" ./)
+          (cd custom_components/additional_ca && zip -r "$GITHUB_WORKSPACE/additional_ca.zip" ./ -x "*__pycache__*")
           git checkout custom_components/additional_ca/manifest.json
           gh release create "$version" additional_ca.zip --target "$(git rev-parse HEAD)" --title "$version" \
             --notes "Upstream [$tag](https://github.com/$UPSTREAM/releases/tag/$tag) plus loading custom CAs into Home Assistant's SSL contexts at startup, so a Home Assistant update needs no second restart."
