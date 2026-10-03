@@ -1,7 +1,7 @@
 name: "Sync upstream"
 
-# Merges each new upstream release into this fork's main branch, tests it, and publishes it as <upstream tag>.1 for HACS.
-# Merge, not rebase: GITHUB_TOKEN cannot push commits that touch .github/workflows, and a rebase would rewrite the commit adding this file.
+# Applies each new upstream release to this fork's main branch as one commit, tests it, and publishes it as <upstream tag>.1 for HACS.
+# No upstream commit enters the fork, so no push touches a workflow file (GITHUB_TOKEN cannot push those); a release that conflicts fails the job.
 
 on:
   schedule:
@@ -14,9 +14,13 @@ permissions:
 
 concurrency: sync-upstream
 
+defaults:
+  run:
+    # an explicit bash adds -o pipefail
+    shell: bash
+
 env:
   UPSTREAM: Athozs/hass-additional-ca
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   sync:
@@ -24,15 +28,20 @@ jobs:
     steps:
       - name: "Keep the schedule enabled"
         # GitHub disables scheduled workflows after 60 days without repository activity
-        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/sync-upstream.yml/enable"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/sync-upstream.yml/enable"
 
       - name: "Find the latest upstream release"
         id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           pattern="^$(printf '%s' "$tag" | sed 's/\./\\./g')\.[0-9]+$"
-          if gh release list --repo "${{ github.repository }}" --limit 100 --json tagName --jq '.[].tagName' | grep -qE "$pattern"; then
+          released=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName')
+          if grep -qE "$pattern" <<< "$released"; then
             echo "Upstream $tag is already released here."
             echo "new=false" >> "$GITHUB_OUTPUT"
           else
@@ -45,13 +54,25 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: "Merge the upstream release"
+      - name: "Apply the upstream release"
         if: steps.upstream.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/${{ steps.upstream.outputs.tag }}"
-          git merge --no-edit -m "Merge upstream release ${{ steps.upstream.outputs.tag }}" FETCH_HEAD
+          last=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' | sort -V | tail -n 1)
+          if [ -z "$last" ]; then
+            echo "::error::This fork has no release to take the previous upstream tag from."
+            exit 1
+          fi
+          prev="${last%.*}"
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "+refs/tags/$prev:refs/upstream-tags/$prev" "+refs/tags/$TAG:refs/upstream-tags/$TAG"
+          git diff --binary "refs/upstream-tags/$prev" "refs/upstream-tags/$TAG" -- . ':(exclude).github/workflows' | git apply --3way --index --allow-empty
+          if ! git diff --cached --quiet; then
+            git commit -m "Sync upstream release $TAG"
+          fi
 
       - name: "Set up Python"
         if: steps.upstream.outputs.new == 'true'
@@ -76,11 +97,12 @@ jobs:
 
       - name: "Publish the release"
         if: steps.upstream.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
-          tag="${{ steps.upstream.outputs.tag }}"
-          version="$tag.1"
+          version="$TAG.1"
           yq -i -o json ".version=\"$version\"" custom_components/additional_ca/manifest.json
           (cd custom_components/additional_ca && zip -r "$GITHUB_WORKSPACE/additional_ca.zip" ./ -x "*__pycache__*")
-          git checkout custom_components/additional_ca/manifest.json
           gh release create "$version" additional_ca.zip --target "$(git rev-parse HEAD)" --title "$version" \
-            --notes "Upstream [$tag](https://github.com/$UPSTREAM/releases/tag/$tag) plus loading custom CAs into Home Assistant's SSL contexts at startup, so a Home Assistant update needs no second restart."
+            --notes "Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) plus loading custom CAs into Home Assistant's SSL contexts at startup, so a Home Assistant update needs no second restart."
