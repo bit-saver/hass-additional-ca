@@ -1,7 +1,8 @@
 name: "Sync upstream"
 
-# Applies each new upstream release to this fork's main branch as one commit, tests it, and publishes it as <upstream tag>.1 for HACS.
+# Applies each new upstream release to this fork's main branch as one commit, checks the in-place trust patch survived, tests it, and publishes it as <upstream tag>.1 for HACS.
 # No upstream commit enters the fork, so no push touches a workflow file (GITHUB_TOKEN cannot push those); a release that conflicts fails the job.
+# The checkout keeps no token in .git/config, so upstream's tests and requirements never see it; the Push step authenticates through gh.
 
 on:
   schedule:
@@ -53,6 +54,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: "Apply the upstream release"
         if: steps.upstream.outputs.new == 'true'
@@ -62,7 +64,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          last=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' | sort -V | tail -n 1)
+          last=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --exclude-drafts --json tagName --jq '.[0].tagName')
           if [ -z "$last" ]; then
             echo "::error::This fork has no release to take the previous upstream tag from."
             exit 1
@@ -72,6 +74,15 @@ jobs:
           git diff --binary "refs/upstream-tags/$prev" "refs/upstream-tags/$TAG" -- . ':(exclude).github/workflows' | git apply --3way --index --allow-empty
           if ! git diff --cached --quiet; then
             git commit -m "Sync upstream release $TAG"
+          fi
+
+      - name: "Check the in-place trust patch survived"
+        if: steps.upstream.outputs.new == 'true'
+        run: |
+          if ! grep -q '^def load_ca_into_hass_ssl_contexts(' custom_components/additional_ca/utils.py \
+            || ! grep -qF 'async_add_executor_job(load_ca_into_hass_ssl_contexts,' custom_components/additional_ca/__init__.py; then
+            echo "::error::This release no longer defines and calls load_ca_into_hass_ssl_contexts; port the in-place trust patch by hand."
+            exit 1
           fi
 
       - name: "Set up Python"
@@ -93,7 +104,11 @@ jobs:
 
       - name: "Push"
         if: steps.upstream.outputs.new == 'true'
-        run: git push origin HEAD:main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh auth setup-git
+          git push origin HEAD:main
 
       - name: "Publish the release"
         if: steps.upstream.outputs.new == 'true'
